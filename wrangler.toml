@@ -1,0 +1,3 @@
+name = "summarizer-worker"
+main = "src/index.ts"
+compatibility_date = "2026-02-05"
