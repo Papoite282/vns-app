@@ -13,8 +13,24 @@ type Summary = {
   language: "pt" | "en";
 };
 
+type UserProfile = {
+  sub: string; // unique user id
+  name?: string;
+  email?: string;
+  picture?: string;
+};
+
+type Note = {
+  id: string;
+  createdAt: number;
+  title: string;
+  transcript: string;
+  summary: Summary | null;
+};
+
 declare global {
   interface Window {
+    google?: any;
     webkitSpeechRecognition?: any;
     SpeechRecognition?: any;
   }
@@ -24,26 +40,52 @@ function getSpeechRecognitionCtor() {
   return window.SpeechRecognition || window.webkitSpeechRecognition;
 }
 
-export default function Home() {
-  const [isRecording, setIsRecording] = useState(false);
+function decodeJwtPayload(token: string): any | null {
+  try {
+    const part = token.split(".")[1];
+    if (!part) return null;
+    const base64 = part.replace(/-/g, "+").replace(/_/g, "/");
+    const json = decodeURIComponent(
+      atob(base64)
+        .split("")
+        .map((c) => "%" + ("00" + c.charCodeAt(0).toString(16)).slice(-2))
+        .join("")
+    );
+    return JSON.parse(json);
+  } catch {
+    return null;
+  }
+}
 
-  // Full transcript (final + interim)
+function makeNoteTitle(summary: Summary | null, transcript: string) {
+  if (summary?.title?.trim()) return summary.title.trim();
+  const t = transcript.trim();
+  return t.length ? (t.slice(0, 48) + (t.length > 48 ? "…" : "")) : "Untitled note";
+}
+
+export default function Home() {
+  // ===== Google login =====
+  const [idToken, setIdToken] = useState<string | null>(null);
+  const [user, setUser] = useState<UserProfile | null>(null);
+  const googleBtnRef = useRef<HTMLDivElement | null>(null);
+
+  // ===== Notes (localStorage by user) =====
+  const [notes, setNotes] = useState<Note[]>([]);
+  const [selectedNoteId, setSelectedNoteId] = useState<string | null>(null);
+
+  // ===== Live transcription =====
+  const [isRecording, setIsRecording] = useState(false);
   const [finalText, setFinalText] = useState("");
   const [interimText, setInterimText] = useState("");
 
-  // UI / status
   const [error, setError] = useState<string | null>(null);
   const [lang, setLang] = useState<"pt-PT" | "en-US">("pt-PT");
   const [autoLang, setAutoLang] = useState(true);
 
-  // Gemini summary (parallel)
   const [summary, setSummary] = useState<Summary | null>(null);
   const [summaryStatus, setSummaryStatus] = useState<"idle" | "updating" | "ok" | "error">("idle");
 
-  // Speech recognition instance
   const recRef = useRef<any>(null);
-
-  // Debounce timers
   const debounceRef = useRef<number | null>(null);
   const lastSentRef = useRef<string>("");
 
@@ -52,7 +94,124 @@ export default function Home() {
     return full.replace(/\s+/g, " ");
   }, [finalText, interimText]);
 
-  // Auto language heuristic (very lightweight)
+  // ===== Helpers for notes storage key =====
+  const storageKey = useMemo(() => {
+    // if logged in, store per user sub; otherwise guest
+    const sub = user?.sub ?? "guest";
+    return `vns_notes_${sub}`;
+  }, [user?.sub]);
+
+  function loadNotes() {
+    try {
+      const raw = localStorage.getItem(storageKey);
+      const parsed = raw ? (JSON.parse(raw) as Note[]) : [];
+      // newest first
+      parsed.sort((a, b) => b.createdAt - a.createdAt);
+      setNotes(parsed);
+      if (parsed.length && !selectedNoteId) setSelectedNoteId(parsed[0].id);
+    } catch {
+      setNotes([]);
+    }
+  }
+
+  function persistNotes(next: Note[]) {
+    setNotes(next);
+    localStorage.setItem(storageKey, JSON.stringify(next));
+  }
+
+  // Load token/profile on boot
+  useEffect(() => {
+    const saved = localStorage.getItem("vns_google_id_token");
+    if (saved) {
+      setIdToken(saved);
+      const payload = decodeJwtPayload(saved);
+      if (payload?.sub) {
+        setUser({
+          sub: payload.sub,
+          name: payload.name,
+          email: payload.email,
+          picture: payload.picture,
+        });
+      }
+    }
+  }, []);
+
+  // Whenever storageKey changes (login/logout), reload notes for that user
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    loadNotes();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [storageKey]);
+
+  // Init Google button
+  useEffect(() => {
+    const clientId = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID;
+    if (!clientId) {
+      setError("Falta NEXT_PUBLIC_GOOGLE_CLIENT_ID no .env.local.");
+      return;
+    }
+
+    const tryInit = () => {
+      if (!window.google?.accounts?.id) return false;
+
+      window.google.accounts.id.initialize({
+        client_id: clientId,
+        callback: (resp: any) => {
+          const token = resp?.credential;
+          if (!token) return;
+          localStorage.setItem("vns_google_id_token", token);
+          setIdToken(token);
+
+          const payload = decodeJwtPayload(token);
+          if (payload?.sub) {
+            setUser({
+              sub: payload.sub,
+              name: payload.name,
+              email: payload.email,
+              picture: payload.picture,
+            });
+          }
+
+          // notes will reload because storageKey changes
+        },
+      });
+
+      if (googleBtnRef.current) {
+        googleBtnRef.current.innerHTML = "";
+        window.google.accounts.id.renderButton(googleBtnRef.current, {
+          theme: "outline",
+          size: "large",
+          shape: "pill",
+          text: "continue_with",
+        });
+      }
+      return true;
+    };
+
+    // Script may load slightly later
+    const t = window.setInterval(() => {
+      if (tryInit()) window.clearInterval(t);
+    }, 250);
+
+    return () => window.clearInterval(t);
+  }, []);
+
+  function signOut() {
+    localStorage.removeItem("vns_google_id_token");
+    setIdToken(null);
+    setUser(null);
+    setSelectedNoteId(null);
+    setFinalText("");
+    setInterimText("");
+    setSummary(null);
+    setSummaryStatus("idle");
+    lastSentRef.current = "";
+    try {
+      window.google?.accounts?.id?.disableAutoSelect?.();
+    } catch {}
+  }
+
+  // ===== Auto language heuristic =====
   useEffect(() => {
     if (!autoLang) return;
     const t = combinedTranscript.toLowerCase();
@@ -68,15 +227,6 @@ export default function Home() {
     if (enScore > ptScore) setLang("en-US");
   }, [combinedTranscript, autoLang]);
 
-  function resetAll() {
-    setError(null);
-    setFinalText("");
-    setInterimText("");
-    setSummary(null);
-    setSummaryStatus("idle");
-    lastSentRef.current = "";
-  }
-
   function stopRecognition() {
     try {
       recRef.current?.stop?.();
@@ -90,11 +240,16 @@ export default function Home() {
 
     const Ctor = getSpeechRecognitionCtor();
     if (!Ctor) {
-      setError("O teu browser não suporta SpeechRecognition. Usa Chrome/Edge no desktop para live transcription.");
+      setError("O teu browser não suporta SpeechRecognition. Usa Chrome/Edge no desktop.");
       return;
     }
 
-    resetAll();
+    // reset current draft
+    setFinalText("");
+    setInterimText("");
+    setSummary(null);
+    setSummaryStatus("idle");
+    lastSentRef.current = "";
 
     const rec = new Ctor();
     recRef.current = rec;
@@ -117,19 +272,16 @@ export default function Home() {
       if (finalized) setFinalText((prev) => (prev + " " + finalized).replace(/\s+/g, " ").trim());
       setInterimText(interim.trim());
 
-      // Trigger parallel summarization updates
       scheduleSummaryUpdate();
     };
 
     rec.onerror = (e: any) => {
-      // Common: "no-speech" / "aborted" / "network"
       setError(`SpeechRecognition error: ${e?.error ?? "unknown"}`);
       setIsRecording(false);
       stopRecognition();
     };
 
     rec.onend = () => {
-      // If still recording, auto-restart (keeps live transcription stable)
       if (isRecording) {
         try {
           rec.start();
@@ -141,56 +293,46 @@ export default function Home() {
       rec.start();
       setIsRecording(true);
     } catch (e: any) {
-      setError(e?.message ?? "Não foi possível iniciar a gravação.");
+      setError(e?.message ?? "Não foi possível iniciar.");
     }
   }
 
   function stop() {
     setIsRecording(false);
     stopRecognition();
-    // Do one last summary update with the final combined text
     void updateSummaryNow(true);
   }
 
   function scheduleSummaryUpdate() {
     if (!isRecording) return;
+    if (debounceRef.current) window.clearTimeout(debounceRef.current);
 
-    if (debounceRef.current) {
-      window.clearTimeout(debounceRef.current);
-    }
     debounceRef.current = window.setTimeout(() => {
       void updateSummaryNow(false);
-    }, 1200); // update ~1.2s after you pause speaking
+    }, 1200);
   }
 
   async function updateSummaryNow(force: boolean) {
     const text = combinedTranscript.trim();
     if (!text) return;
 
-    // avoid spamming: only send if meaningfully changed
     const last = lastSentRef.current;
     const delta = Math.abs(text.length - last.length);
     if (!force && (delta < 25 || text === last)) return;
 
     lastSentRef.current = text;
     setSummaryStatus("updating");
+    setError(null);
 
     try {
       const apiUrl = process.env.NEXT_PUBLIC_SUMMARY_API_URL;
       if (!apiUrl) throw new Error("Falta NEXT_PUBLIC_SUMMARY_API_URL no .env.local.");
 
-      // Map UI lang to pt/en preference
       const preferred_language = lang.startsWith("pt") ? "pt" : "en";
-
       const res = await fetch(apiUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          transcript: text,
-          preferred_language,
-          // optional hint: "live" (if you want your Worker to be more concise during live)
-          mode: isRecording ? "live" : "final",
-        }),
+        body: JSON.stringify({ transcript: text, preferred_language, mode: isRecording ? "live" : "final" }),
       });
 
       if (!res.ok) {
@@ -203,18 +345,115 @@ export default function Home() {
       setSummaryStatus("ok");
     } catch (e: any) {
       setSummaryStatus("error");
-      setError((prev) => prev ?? `Resumo (Gemini) falhou: ${e?.message ?? "erro"}`);
+      setError(`Resumo (Gemini) falhou: ${e?.message ?? "erro"}`);
     }
   }
 
-  // Ensure recognition uses updated language if user changes it
-  useEffect(() => {
-    if (recRef.current) {
-      try {
-        recRef.current.lang = lang;
-      } catch {}
+  function saveNote() {
+    const transcript = combinedTranscript.trim();
+    if (!transcript) {
+      setError("Nada para guardar. Faz uma gravação primeiro.");
+      return;
     }
-  }, [lang]);
+
+    const now = Date.now();
+    const note: Note = {
+      id: crypto.randomUUID(),
+      createdAt: now,
+      title: makeNoteTitle(summary, transcript),
+      transcript,
+      summary: summary ?? null,
+    };
+
+    const next = [note, ...notes].slice(0, 50); // keep last 50 locally
+    persistNotes(next);
+    setSelectedNoteId(note.id);
+  }
+
+  function loadNote(noteId: string) {
+    const n = notes.find((x) => x.id === noteId);
+    if (!n) return;
+    setSelectedNoteId(noteId);
+    setFinalText(n.transcript);
+    setInterimText("");
+    setSummary(n.summary);
+    setSummaryStatus(n.summary ? "ok" : "idle");
+    lastSentRef.current = n.transcript;
+  }
+
+  function deleteNote(noteId: string) {
+    const next = notes.filter((n) => n.id !== noteId);
+    persistNotes(next);
+    if (selectedNoteId === noteId) {
+      setSelectedNoteId(next[0]?.id ?? null);
+      if (next[0]) loadNote(next[0].id);
+      else {
+        setFinalText("");
+        setInterimText("");
+        setSummary(null);
+        setSummaryStatus("idle");
+      }
+    }
+  }
+
+  function prettySummaryText(s: Summary, transcript: string) {
+    const lines: string[] = [];
+    lines.push(`# ${s.title}`);
+    lines.push(s.one_liner);
+    lines.push("");
+    lines.push(`## Action items`);
+    if (s.action_items?.length) {
+      for (const a of s.action_items) {
+        const bits = [a.task, a.owner ? `(${a.owner})` : null, a.due_date ? `due: ${a.due_date}` : null, a.priority ? `prio: ${a.priority}` : null]
+          .filter(Boolean)
+          .join(" ");
+        lines.push(`- ${bits}`);
+      }
+    } else {
+      lines.push(`- (none)`);
+    }
+    lines.push("");
+    lines.push(`## Key points`);
+    for (const k of s.key_points ?? []) lines.push(`- ${k}`);
+    if (s.decisions?.length) {
+      lines.push("");
+      lines.push(`## Decisions`);
+      for (const d of s.decisions) lines.push(`- ${d}`);
+    }
+    if (s.open_questions?.length) {
+      lines.push("");
+      lines.push(`## Open questions`);
+      for (const q of s.open_questions) lines.push(`- ${q}`);
+    }
+    if (s.tags?.length) {
+      lines.push("");
+      lines.push(`Tags: ${s.tags.join(", ")}`);
+    }
+    lines.push("");
+    lines.push(`---`);
+    lines.push(`Transcript:`);
+    lines.push(transcript);
+    return lines.join("\n");
+  }
+
+  async function copyPretty() {
+    if (!summary) return;
+    await navigator.clipboard.writeText(prettySummaryText(summary, combinedTranscript.trim()));
+  }
+
+  async function ttsPlay() {
+    if (!summary) return;
+    const text = prettySummaryText(summary, combinedTranscript.trim());
+
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = summary.language === "pt" ? "pt-PT" : "en-US";
+    window.speechSynthesis.cancel();
+    window.speechSynthesis.speak(u);
+  }
+
+  function ttsStop() {
+    window.speechSynthesis.cancel();
+  }
 
   return (
     <main style={ui.page}>
@@ -222,11 +461,27 @@ export default function Home() {
 
       <header style={ui.header}>
         <div>
-          <h1 style={ui.h1}>Voice Note Summarizer</h1>
-          <p style={ui.sub}>Live transcript + resumo em paralelo (PT/EN)</p>
+          <h1 style={ui.h1}>VNS</h1>
+          <p style={ui.sub}>Live transcript + Gemini summary • Login Google → notas recentes por perfil</p>
         </div>
 
-        <div style={ui.pills}>
+        <div style={ui.rightHeader}>
+          {!user ? (
+            <div>
+              <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 6 }}>Login (Google)</div>
+              <div ref={googleBtnRef} />
+            </div>
+          ) : (
+            <div style={ui.userBox}>
+              {user.picture ? <img src={user.picture} alt="avatar" style={ui.avatar} /> : <div style={ui.avatarFallback} />}
+              <div>
+                <div style={{ fontWeight: 800, lineHeight: 1.2 }}>{user.name ?? "Logged in"}</div>
+                <div style={{ fontSize: 12, opacity: 0.8 }}>{user.email ?? ""}</div>
+              </div>
+              <button style={ui.btnGhost} onClick={signOut}>Logout</button>
+            </div>
+          )}
+
           <div style={ui.pill}>
             <span style={{ opacity: 0.8 }}>Idioma</span>
             <select
@@ -243,26 +498,20 @@ export default function Home() {
               <option value="en-US">EN</option>
             </select>
             <label style={ui.toggle}>
-              <input
-                type="checkbox"
-                checked={autoLang}
-                onChange={(e) => setAutoLang(e.target.checked)}
-              />
+              <input type="checkbox" checked={autoLang} onChange={(e) => setAutoLang(e.target.checked)} />
               <span>Auto</span>
             </label>
-          </div>
-
-          <div style={ui.pill}>
-            <span style={{ opacity: 0.8 }}>Gemini</span>
-            <span style={ui.statusDot(summaryStatus)} />
-            <span style={{ fontSize: 12 }}>
-              {summaryStatus === "updating" ? "a atualizar…" : summaryStatus === "ok" ? "ok" : summaryStatus === "error" ? "erro" : "idle"}
-            </span>
           </div>
         </div>
       </header>
 
-      <section style={ui.controls}>
+      {error && (
+        <div style={ui.alert}>
+          <b>⚠️</b> <span>{error}</span>
+        </div>
+      )}
+
+      <section style={ui.topControls}>
         {!isRecording ? (
           <button style={ui.btnPrimary} onClick={start}>
             ● Start
@@ -277,26 +526,72 @@ export default function Home() {
           ⟳ Atualizar resumo
         </button>
 
-        <button style={ui.btnGhost} onClick={resetAll}>
-          Limpar
+        <button style={ui.btn} onClick={saveNote} disabled={!combinedTranscript.trim()}>
+          💾 Guardar nota
+        </button>
+
+        <button style={ui.btn} onClick={copyPretty} disabled={!summary}>
+          📋 Copiar resumo
+        </button>
+
+        <button style={ui.btn} onClick={ttsPlay} disabled={!summary}>
+          🔊 Play
+        </button>
+        <button style={ui.btnGhost} onClick={ttsStop}>
+          ⏹️ Stop áudio
         </button>
       </section>
 
-      {error && (
-        <div style={ui.alert}>
-          <b>⚠️</b> <span>{error}</span>
-        </div>
-      )}
+      <section style={ui.grid3}>
+        {/* Notes list */}
+        <div style={ui.card}>
+          <div style={ui.cardHeader}>
+            <h2 style={ui.h2}>Notas recentes</h2>
+            <span style={ui.badgeSoft}>{user ? "perfil" : "guest"}</span>
+          </div>
 
-      <section style={ui.grid}>
-        {/* Full transcript */}
+          <div style={ui.scroll}>
+            {notes.length ? (
+              notes.map((n) => (
+                <div key={n.id} style={ui.noteRow(selectedNoteId === n.id)} onClick={() => loadNote(n.id)}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                    <div style={{ fontWeight: 800, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{n.title}</div>
+                    <div style={{ fontSize: 12, opacity: 0.65 }}>{new Date(n.createdAt).toLocaleString()}</div>
+                  </div>
+                  <div style={{ fontSize: 12, opacity: 0.8, marginTop: 4, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {n.summary?.one_liner ?? n.transcript}
+                  </div>
+                  <div style={{ marginTop: 8 }}>
+                    <button
+                      style={ui.smallDanger}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        deleteNote(n.id);
+                      }}
+                    >
+                      Apagar
+                    </button>
+                  </div>
+                </div>
+              ))
+            ) : (
+              <div style={{ opacity: 0.7, padding: 12 }}>Ainda não tens notas guardadas.</div>
+            )}
+          </div>
+
+          <div style={ui.cardFooter}>
+            <span style={ui.meta}>LocalStorage key: {storageKey}</span>
+          </div>
+        </div>
+
+        {/* Live transcript */}
         <div style={ui.card}>
           <div style={ui.cardHeader}>
             <h2 style={ui.h2}>Versão completa (live)</h2>
             <span style={ui.badge}>{isRecording ? "LIVE" : "PAUSED"}</span>
           </div>
 
-          <div style={ui.editor}>
+          <div style={ui.scroll}>
             <p style={ui.text}>{finalText}</p>
             {interimText && (
               <p style={ui.interim}>
@@ -304,31 +599,22 @@ export default function Home() {
                 <span style={ui.cursor} />
               </p>
             )}
-            {!combinedTranscript && <p style={ui.placeholder}>Começa a falar para ver o texto a aparecer aqui…</p>}
+            {!combinedTranscript && <p style={ui.placeholder}>Clica Start e fala — o texto aparece aqui em tempo real…</p>}
           </div>
 
           <div style={ui.cardFooter}>
             <span style={ui.meta}>Chars: {combinedTranscript.length}</span>
-            <button
-              style={ui.copyBtn}
-              onClick={async () => {
-                await navigator.clipboard.writeText(combinedTranscript);
-              }}
-              disabled={!combinedTranscript}
-            >
-              Copy
-            </button>
           </div>
         </div>
 
-        {/* Parallel summary */}
+        {/* Summary */}
         <div style={ui.card}>
           <div style={ui.cardHeader}>
             <h2 style={ui.h2}>Resumo (Gemini)</h2>
-            <span style={ui.badgeSoft}>AUTO</span>
+            <span style={ui.badgeSoft}>{summaryStatus}</span>
           </div>
 
-          <div style={ui.summaryBox}>
+          <div style={ui.scroll}>
             {summary ? (
               <>
                 <div style={ui.summaryTitle}>{summary.title}</div>
@@ -338,7 +624,7 @@ export default function Home() {
                   <div style={ui.sectionTitle}>Action items</div>
                   {summary.action_items?.length ? (
                     <ul style={ui.ul}>
-                      {summary.action_items.slice(0, 6).map((a, i) => (
+                      {summary.action_items.map((a, i) => (
                         <li key={i} style={ui.li}>
                           <b>{a.task}</b>
                           {a.owner ? <span style={ui.dim}> — {a.owner}</span> : null}
@@ -347,42 +633,34 @@ export default function Home() {
                       ))}
                     </ul>
                   ) : (
-                    <div style={ui.dim}>Sem action items ainda.</div>
+                    <div style={ui.dim}>Sem action items.</div>
                   )}
                 </div>
 
                 <div style={ui.section}>
                   <div style={ui.sectionTitle}>Key points</div>
                   <ul style={ui.ul}>
-                    {(summary.key_points ?? []).slice(0, 6).map((k, i) => (
-                      <li key={i} style={ui.li}>{k}</li>
+                    {(summary.key_points ?? []).map((k, i) => (
+                      <li key={i} style={ui.li}>
+                        {k}
+                      </li>
                     ))}
                   </ul>
                 </div>
               </>
             ) : (
-              <div style={ui.placeholder}>O resumo vai aparecendo aqui enquanto falas…</div>
+              <div style={ui.placeholder}>O resumo vai aparecer aqui enquanto falas…</div>
             )}
           </div>
 
           <div style={ui.cardFooter}>
             <span style={ui.meta}>Lang: {lang.startsWith("pt") ? "PT" : "EN"}</span>
-            <button
-              style={ui.copyBtn}
-              onClick={async () => {
-                await navigator.clipboard.writeText(JSON.stringify(summary, null, 2));
-              }}
-              disabled={!summary}
-              title="Copia JSON do resumo"
-            >
-              Copy JSON
-            </button>
           </div>
         </div>
       </section>
 
       <footer style={ui.footer}>
-        Dica: para melhor “live”, usa Chrome/Edge. O “Stop” força um resumo final.
+        Nota: este login é para “perfil” + separar notas no teu browser. O próximo passo é sincronizar notas na cloud (Worker + D1).
       </footer>
     </main>
   );
@@ -393,7 +671,8 @@ const ui: Record<string, any> = {
     minHeight: "100vh",
     padding: 24,
     color: "#EAF2FF",
-    background: "radial-gradient(1200px 700px at 15% 10%, #1b2b72 0%, rgba(14, 18, 34, 0) 60%), radial-gradient(900px 600px at 85% 20%, #6b1ed6 0%, rgba(14, 18, 34, 0) 55%), linear-gradient(180deg, #070A12, #050713)",
+    background:
+      "radial-gradient(1200px 700px at 15% 10%, #1b2b72 0%, rgba(14, 18, 34, 0) 60%), radial-gradient(900px 600px at 85% 20%, #6b1ed6 0%, rgba(14, 18, 34, 0) 55%), linear-gradient(180deg, #070A12, #050713)",
     fontFamily: "ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial",
     position: "relative",
     overflow: "hidden",
@@ -405,10 +684,10 @@ const ui: Record<string, any> = {
     filter: "blur(10px)",
     pointerEvents: "none",
   },
-  header: { display: "flex", justifyContent: "space-between", gap: 16, alignItems: "flex-start", maxWidth: 1200, margin: "0 auto 18px" },
+  header: { display: "flex", justifyContent: "space-between", gap: 16, alignItems: "flex-start", maxWidth: 1300, margin: "0 auto 14px" },
+  rightHeader: { display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-start", justifyContent: "flex-end" },
   h1: { margin: 0, fontSize: 28, letterSpacing: 0.2 },
   sub: { margin: "6px 0 0", opacity: 0.8 },
-  pills: { display: "flex", gap: 10, flexWrap: "wrap" },
   pill: {
     display: "flex",
     alignItems: "center",
@@ -428,18 +707,7 @@ const ui: Record<string, any> = {
     outline: "none",
   },
   toggle: { display: "flex", gap: 6, alignItems: "center", fontSize: 12, opacity: 0.9 },
-  statusDot: (s: string) => ({
-    width: 8,
-    height: 8,
-    borderRadius: 99,
-    background:
-      s === "ok" ? "rgba(0,255,180,0.9)" :
-      s === "updating" ? "rgba(0,200,255,0.95)" :
-      s === "error" ? "rgba(255,80,120,0.95)" :
-      "rgba(255,255,255,0.35)",
-    boxShadow: s === "ok" ? "0 0 18px rgba(0,255,180,0.35)" : s === "updating" ? "0 0 18px rgba(0,200,255,0.35)" : "none",
-  }),
-  controls: { maxWidth: 1200, margin: "0 auto 18px", display: "flex", gap: 10, flexWrap: "wrap" },
+  topControls: { maxWidth: 1300, margin: "0 auto 14px", display: "flex", gap: 10, flexWrap: "wrap" },
   btnPrimary: {
     padding: "10px 14px",
     borderRadius: 14,
@@ -447,7 +715,6 @@ const ui: Record<string, any> = {
     background: "linear-gradient(135deg, rgba(0,255,255,0.18), rgba(107,30,214,0.12))",
     color: "#EAF2FF",
     cursor: "pointer",
-    boxShadow: "0 0 24px rgba(0,255,255,0.10)",
   },
   btnDanger: {
     padding: "10px 14px",
@@ -456,7 +723,6 @@ const ui: Record<string, any> = {
     background: "linear-gradient(135deg, rgba(255,80,120,0.22), rgba(107,30,214,0.10))",
     color: "#EAF2FF",
     cursor: "pointer",
-    boxShadow: "0 0 24px rgba(255,80,120,0.10)",
   },
   btn: {
     padding: "10px 14px",
@@ -476,8 +742,8 @@ const ui: Record<string, any> = {
     cursor: "pointer",
   },
   alert: {
-    maxWidth: 1200,
-    margin: "0 auto 16px",
+    maxWidth: 1300,
+    margin: "0 auto 14px",
     padding: "10px 12px",
     borderRadius: 14,
     border: "1px solid rgba(255,120,120,0.35)",
@@ -486,7 +752,7 @@ const ui: Record<string, any> = {
     gap: 10,
     alignItems: "center",
   },
-  grid: { maxWidth: 1200, margin: "0 auto", display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 },
+  grid3: { maxWidth: 1300, margin: "0 auto", display: "grid", gridTemplateColumns: "1.1fr 1.4fr 1.4fr", gap: 14 },
   card: {
     borderRadius: 18,
     border: "1px solid rgba(255,255,255,0.12)",
@@ -496,30 +762,36 @@ const ui: Record<string, any> = {
     overflow: "hidden",
     display: "flex",
     flexDirection: "column",
-    minHeight: 420,
+    minHeight: 520,
   },
   cardHeader: { padding: "14px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: "1px solid rgba(255,255,255,0.10)" },
-  h2: { margin: 0, fontSize: 14, letterSpacing: 0.6, textTransform: "uppercase", opacity: 0.9 },
-  badge: {
-    fontSize: 11,
-    padding: "4px 10px",
-    borderRadius: 99,
-    border: "1px solid rgba(0,255,255,0.30)",
-    background: "rgba(0,255,255,0.10)",
-  },
-  badgeSoft: {
-    fontSize: 11,
-    padding: "4px 10px",
-    borderRadius: 99,
-    border: "1px solid rgba(255,255,255,0.16)",
-    background: "rgba(255,255,255,0.06)",
-  },
-  editor: { padding: 16, flex: 1, overflow: "auto" },
+  cardFooter: { padding: "12px 16px", borderTop: "1px solid rgba(255,255,255,0.10)" },
+  h2: { margin: 0, fontSize: 13, letterSpacing: 0.6, textTransform: "uppercase", opacity: 0.9 },
+  badge: { fontSize: 11, padding: "4px 10px", borderRadius: 99, border: "1px solid rgba(0,255,255,0.30)", background: "rgba(0,255,255,0.10)" },
+  badgeSoft: { fontSize: 11, padding: "4px 10px", borderRadius: 99, border: "1px solid rgba(255,255,255,0.16)", background: "rgba(255,255,255,0.06)" },
+  scroll: { padding: 16, flex: 1, overflow: "auto" },
   text: { margin: 0, whiteSpace: "pre-wrap", lineHeight: 1.5 },
   interim: { margin: "10px 0 0", whiteSpace: "pre-wrap", opacity: 0.85, lineHeight: 1.5 },
-  cursor: { display: "inline-block", width: 8, height: 16, marginLeft: 6, background: "rgba(0,255,255,0.75)", boxShadow: "0 0 18px rgba(0,255,255,0.35)", verticalAlign: "text-bottom", animation: "blink 1s steps(2, start) infinite" },
+  cursor: { display: "inline-block", width: 8, height: 16, marginLeft: 6, background: "rgba(0,255,255,0.75)", verticalAlign: "text-bottom" },
   placeholder: { opacity: 0.6, margin: 0 },
-  summaryBox: { padding: 16, flex: 1, overflow: "auto" },
+  meta: { fontSize: 12, opacity: 0.7 },
+  noteRow: (active: boolean) => ({
+    borderRadius: 14,
+    border: "1px solid rgba(255,255,255,0.12)",
+    background: active ? "rgba(0,255,255,0.08)" : "rgba(255,255,255,0.04)",
+    padding: 12,
+    marginBottom: 10,
+    cursor: "pointer",
+  }),
+  smallDanger: {
+    padding: "6px 10px",
+    borderRadius: 12,
+    border: "1px solid rgba(255,80,120,0.40)",
+    background: "rgba(255,80,120,0.12)",
+    color: "#EAF2FF",
+    cursor: "pointer",
+    fontSize: 12,
+  },
   summaryTitle: { fontWeight: 800, fontSize: 16, marginBottom: 6 },
   oneLiner: { opacity: 0.9, marginBottom: 14 },
   section: { marginTop: 14 },
@@ -527,21 +799,17 @@ const ui: Record<string, any> = {
   ul: { margin: 0, paddingLeft: 18 },
   li: { marginBottom: 8 },
   dim: { opacity: 0.75 },
-  cardFooter: {
-    padding: "12px 16px",
-    borderTop: "1px solid rgba(255,255,255,0.10)",
+  userBox: {
     display: "flex",
-    justifyContent: "space-between",
+    gap: 10,
     alignItems: "center",
-  },
-  meta: { fontSize: 12, opacity: 0.75 },
-  copyBtn: {
-    padding: "8px 12px",
-    borderRadius: 12,
-    border: "1px solid rgba(255,255,255,0.14)",
+    padding: "10px 12px",
+    borderRadius: 14,
+    border: "1px solid rgba(255,255,255,0.12)",
     background: "rgba(255,255,255,0.06)",
-    color: "#EAF2FF",
-    cursor: "pointer",
+    backdropFilter: "blur(10px)",
   },
-  footer: { maxWidth: 1200, margin: "14px auto 0", opacity: 0.7, fontSize: 12 },
+  avatar: { width: 34, height: 34, borderRadius: 999, objectFit: "cover", border: "1px solid rgba(255,255,255,0.18)" },
+  avatarFallback: { width: 34, height: 34, borderRadius: 999, background: "rgba(255,255,255,0.10)" },
+  footer: { maxWidth: 1300, margin: "12px auto 0", opacity: 0.7, fontSize: 12 },
 };
